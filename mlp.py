@@ -99,13 +99,14 @@ class Validator:
             print("无有效预测结果")
             return
         
-        print(f"\n验证结果（共{len(predictions)}个有效点）:")
-        print(f"初始预测: {predictions[0][1]} (置信度: {predictions[0][2]:.2%})")
-        print(f"最终预测: {predictions[-1][1]} (置信度: {predictions[-1][2]:.2%})")
+        # 统计奇偶结果
+        odd_count = sum(1 for p in predictions if p[1] == '奇数')
+        even_count = sum(1 for p in predictions if p[1] == '偶数')
         
-        # 检查一致性
-        unique_parities = len(set(p[1] for p in predictions))
-        print(f"奇偶一致性: {'是' if unique_parities == 1 else '否'}")
+        print(f"\n验证结果（共{len(predictions)}个有效点）:")
+        print(f"奇数个数: {odd_count} (占比: {odd_count/len(predictions):.2%})")
+        print(f"偶数个数: {even_count} (占比: {even_count/len(predictions):.2%})")
+        
         
         # 检查置信度
         avg_confidence = sum(p[2] for p in predictions) / len(predictions)
