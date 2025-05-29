@@ -8,8 +8,8 @@ import time
 import random
 import argparse
 import signal
+import keyboard
 import numpy as np
-from tqdm import tqdm
 from torch.amp import GradScaler, autocast
 from multiprocessing import Pool, cpu_count
 
@@ -49,9 +49,9 @@ class ECCUtils:
             return None
 
 class Validator:
-    def __init__(self, model_path):
-        self.model = DeepParityMLP()
-        self.model.load_state_dict(torch.load(model_path)['model'])
+    def __init__(self, model, device):
+        self.model = model
+        self.device = device
         self.model.eval()
         self.twoG = ECCUtils.generate_2G()[1:]  # 去掉前缀字节
 
@@ -73,16 +73,16 @@ class Validator:
         ).float()
         
         with torch.no_grad():
-            output = self.model(features.unsqueeze(0))
+            output = self.model(features.unsqueeze(0).to(self.device))
             prob = torch.sigmoid(output).item()
-        return '奇数' if prob > 0.5 else '偶数', abs(prob - 0.5)*2  # 置信度[0-1]
+        return 1 if prob > 0.5 else 0, abs(prob - 0.5)*2  # 置信度[0-1]
 
-    def generate_sequence(self, base_pub_str, length=100):
+    def predict_sequence(self, base_pub_str, length=100):
         """生成并验证连续公钥序列"""
         current_pub = self._parse_public_key(base_pub_str)
         predictions = []
         
-        for _ in tqdm(range(length), desc="生成验证序列"):
+        for _ in range(length):
             # 预测当前公钥
             parity, confidence = self.predict_parity(current_pub)
             predictions.append((current_pub.hex(), parity, confidence))
@@ -100,30 +100,72 @@ class Validator:
             return
         
         # 统计奇偶结果
-        odd_count = sum(1 for p in predictions if p[1] == '奇数')
-        even_count = sum(1 for p in predictions if p[1] == '偶数')
+        odd_count = sum(p[1] for p in predictions)
+        even_count = sum(1 for p in predictions if p[1] == 0)
         
-        print(f"\n验证结果（共{len(predictions)}个有效点）:")
+        print(f"\n给定公钥生成的序列（共{len(predictions)}个有效点）:")
         print(f"奇数个数: {odd_count} (占比: {odd_count/len(predictions):.2%})")
-        print(f"偶数个数: {even_count} (占比: {even_count/len(predictions):.2%})")
-        
+        print(f"偶数个数: {even_count} (占比: {even_count/len(predictions):.2%})")        
         
         # 检查置信度
         avg_confidence = sum(p[2] for p in predictions) / len(predictions)
-        print(f"平均置信度: {avg_confidence:.2%}")
-
+        print(f"平均置信度(100序列): {avg_confidence:.2%}")
+        
+    def _generate_random_sequence(self, length=100):
+        """生成随机连续公钥序列（带真实标签）"""
+        base_priv = int.from_bytes(random.randbytes(32), 'big') % (2**256)
+        true_parity = base_priv % 2
+        sequence = []
+        current_priv = base_priv
+        
+        for _ in range(length):
+            priv_key = PrivateKey(secret=current_priv.to_bytes(32, 'big'))
+            pub = priv_key.public_key.format(compressed=False)[1:]
+            sequence.append(pub)
+            current_priv += 2  # 保持奇偶性不变
+        
+        return sequence, true_parity
+    
+    def validate_effectiveness(self, num_sequences=100, sequence_length=100):
+        """批量验证模型有效性"""
+        correct_count = 0
+        confidence_sum = 0.0
+        
+        for i in range(num_sequences):
+            # 生成随机序列
+            sequence, true_parity = self._generate_random_sequence(sequence_length)
+            
+            # 预测序列中所有点的奇偶性
+            predictions = []
+            for pub_bytes in sequence:
+                predictions.append(self.predict_parity(pub_bytes))
+            
+            # 多数投票决定最终预测
+            majority_vote = 1 if sum(p[0] for p in predictions) > len(predictions)/2 else 0
+            sequence_confidence = np.mean(np.array(list(p[1] for p in predictions)))
+            
+            # 检查预测是否正确
+            if majority_vote == true_parity:
+                correct_count += 1
+                confidence_sum += sequence_confidence
+        
+        # 计算统计指标
+        accuracy = correct_count / num_sequences
+        avg_confidence = confidence_sum / correct_count if correct_count > 0 else 0
+        
+        print(f"\n验证结果（{num_sequences}组序列）:")
+        print(f"准确率: {accuracy*100:.2f}%")
+        print(f"平均置信度(仅计算正确的序列(序列均值)): {avg_confidence*100:.2f}%")
+        return accuracy, avg_confidence
 # ======================
 # 信号处理器
 # ======================
-class TrainingController:
-    def __init__(self):
-        self.should_stop = False
-        signal.signal(signal.SIGINT, self.handler)
-        signal.signal(signal.SIGTERM, self.handler)
+should_stop = False
     
-    def handler(self, signum, frame):
-        print(f"\n捕获信号 {signum}，正在终止训练...")
-        self.should_stop = True
+def stop_handler( ):
+    print(f"\n捕获信号，正在终止训练...")
+    global should_stop
+    should_stop = True
 
 # ======================
 # 数据生成模块
@@ -166,27 +208,24 @@ class KeyPairGenerator:
         with Pool(processes=cpu_count()) as pool:
             chunk_size = 100
             total_chunks = (total_groups + chunk_size - 1) // chunk_size
-            
-            with tqdm(total=total_groups, desc="生成进度") as pbar:
-                for chunk_idx in range(total_chunks):
-                    start_group = chunk_idx * chunk_size
-                    end_group = min((chunk_idx+1)*chunk_size, total_groups)
-                    groups = pool.map(cls._generate_group, [None]*(end_group-start_group))
+            for chunk_idx in range(total_chunks):
+                start_group = chunk_idx * chunk_size
+                end_group = min((chunk_idx+1)*chunk_size, total_groups)
+                groups = pool.map(cls._generate_group, [None]*(end_group-start_group))
+                
+                # 写入内存映射
+                for group_idx, group in enumerate(groups):
+                    for i_in_group, (x, y, label) in enumerate(group):
+                        idx = (start_group + group_idx) * Config.group_size + i_in_group
+                        
+                        # 修正：直接存储字节数据
+                        x_bytes = x.to_bytes(32, 'big')
+                        y_bytes = y.to_bytes(32, 'big')
+                        features = np.frombuffer(x_bytes + y_bytes, dtype=np.uint8)
+                        
+                        memmap[idx, :-1] = features
+                        memmap[idx, -1] = label
                     
-                    # 写入内存映射
-                    for group_idx, group in enumerate(groups):
-                        for i_in_group, (x, y, label) in enumerate(group):
-                            idx = (start_group + group_idx) * Config.group_size + i_in_group
-                            
-                            # 修正：直接存储字节数据
-                            x_bytes = x.to_bytes(32, 'big')
-                            y_bytes = y.to_bytes(32, 'big')
-                            features = np.frombuffer(x_bytes + y_bytes, dtype=np.uint8)
-                            
-                            memmap[idx, :-1] = features
-                            memmap[idx, -1] = label
-                    
-                    pbar.update(len(groups))
         
         print(f"数据集生成完成，耗时 {time.time()-start:.1f}秒")
 
@@ -269,7 +308,6 @@ class DeepParityMLP(nn.Module):
 class TrainingSystem:
     def __init__(self, args):
         self.args = args
-        self.controller = TrainingController()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 初始化模型和优化器
@@ -319,14 +357,12 @@ class TrainingSystem:
         correct = 0
         total = 0
         with torch.no_grad():
-            with tqdm(loader, desc=desc, leave=False) as pbar:
-                for inputs, labels in pbar:
-                    inputs, labels = inputs.to(self.device), labels.to(self.device)
-                    outputs = self.model(inputs)
-                    preds = (torch.sigmoid(outputs) > 0.5).float()
-                    correct += (preds == labels).sum().item()
-                    total += labels.size(0)
-                    pbar.set_postfix(acc=f"{correct/total:.2%}")
+            for inputs, labels in loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                outputs = self.model(inputs)
+                preds = (torch.sigmoid(outputs) > 0.5).float()
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
         return correct / total if total > 0 else 0.0
         
     def _save_checkpoint(self):
@@ -340,22 +376,15 @@ class TrainingSystem:
     def run_training(self):
         try:
             for epoch in range(0, self.args.epochs):
-                if self.controller.should_stop:
+                if should_stop:
                     break
                 
                 self.model.train()
                 epoch_loss = 0.0
                 epoch_acc = 0.0
                 processed_samples = 0
-                
-                train_iter = tqdm(self.train_loader, 
-                                 desc=f"Epoch {epoch+1}/{self.args.epochs}",
-                                 dynamic_ncols=True)
-                
-                for batch_idx, (inputs, labels) in enumerate(train_iter):
-                    if self.controller.should_stop:
-                        break
-                    
+                             
+                for inputs, labels in self.train_loader:                    
                     inputs = inputs.to(self.device, non_blocking=True)
                     labels = labels.to(self.device, non_blocking=True)
                     
@@ -400,9 +429,10 @@ class TrainingSystem:
 
     def _run_validation(self):
         """执行验证流程"""
-        validator = Validator(os.path.join(Config.model_dir, Config.checkpoint_file))
+        validator = Validator(self.model, self.device)
         print("\n=== 验证集测试 ===")
-        validator.generate_sequence(self.validation_pub)
+        validator.validate_effectiveness()
+        validator.predict_sequence(self.validation_pub)
 
 # ======================
 # 主程序
@@ -414,5 +444,24 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=2e-4)    
     args = parser.parse_args()
     os.makedirs(Config.model_dir, exist_ok=True)
-    system = TrainingSystem(args)
-    system.run_training()
+    # 注册快捷键 Ctrl+S
+    keyboard.add_hotkey('ctrl+b', stop_handler)
+    try:
+        session_count = 0
+        while not should_stop:
+            session_count += 1
+            print(f"\n=== 训练会话 {session_count} ===")
+
+            # 删除旧数据集并生成新数据
+            if os.path.exists(Config.dataset_cache):
+                os.remove(Config.dataset_cache)
+                
+            system = TrainingSystem(args)
+            system.run_training()            
+            # 清理资源
+            del system
+            torch.cuda.empty_cache()            
+    except KeyboardInterrupt:
+        print("\n接收到终止信号，结束训练循环")
+    finally:
+        print("训练结束，最终模型已保存")
