@@ -325,8 +325,12 @@ class TrainingSystem:
         #self.validation_pub = "8fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4,dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"
         #判断为奇数
         
-        self.validation_pub = "f286ba59399081e8cd57a7c4327c37ca9ea00f5d6a0096884cf7d0c4e0070e9f,b03087df6527a4070528731ddf8b5eebe4db55bffed52ba0ded5642bef02c8c"
-        Config.order = 1
+        #self.validation_pub = "f286ba59399081e8cd57a7c4327c37ca9ea00f5d6a0096884cf7d0c4e0070e9f,b03087df6527a4070528731ddf8b5eebe4db55bffed52ba0ded5642bef02c8c"
+        #判断为偶数
+        
+        self.validation_pub = "fda774bd460f57a5149f1f7e25246f2b92ab7a8e95139346273b15c7a7a349c7,be36b081633969887ca7ce24d41e7b3653ec8a6b42080f4cf539cd630e01ecb"
+        
+        Config.order = 2
         
         # 加载数据集
         if not os.path.exists(Config.dataset_cache):
@@ -466,8 +470,8 @@ if __name__ == "__main__":
         sys.exit(0)
     
     
-    # 注册快捷键 Ctrl+b
-    keyboard.add_hotkey('ctrl+b', stop_handler)
+    # 注册快捷键 Ctrl+o
+    keyboard.add_hotkey('ctrl+o', stop_handler)
     try:
         session_count = 0
         while not Config.should_stop:
