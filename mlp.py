@@ -24,6 +24,8 @@ class Config:
     num_workers = min(cpu_count(), 8)
     feature_bytes  = 64
     group_size = 20  # 每组20个相同奇偶性的密钥对
+    should_stop = False
+    order = 0
 
 # ======================
 # 椭圆曲线工具类
@@ -113,7 +115,7 @@ class Validator:
         
     def _generate_random_sequence(self, length=100):
         """生成随机连续公钥序列（带真实标签）"""
-        base_priv = int.from_bytes(random.randbytes(32), 'big') % (2**256)
+        base_priv = int.from_bytes(random.randbytes(32), 'big') % (2**(256 - Config.order))
         true_parity = base_priv % 2
         sequence = []
         current_priv = base_priv
@@ -153,29 +155,27 @@ class Validator:
         accuracy = correct_count / num_sequences
         avg_confidence = confidence_sum / correct_count if correct_count > 0 else 0
         
-        print(f"\n验证结果（{num_sequences}组序列）:")
+        print(f"验证结果（{num_sequences}组序列）:")
         print(f"准确率: {accuracy*100:.2f}%")
         print(f"平均置信度(仅计算正确的序列(序列均值)): {avg_confidence*100:.2f}%")
         return accuracy, avg_confidence
 # ======================
 # 信号处理器
 # ======================
-should_stop = False
     
 def stop_handler( ):
     print(f"\n捕获信号，正在终止训练...")
-    global should_stop
-    should_stop = True
+    Config.should_stop = True
 
 # ======================
 # 数据生成模块
 # ======================
 class KeyPairGenerator:
     @staticmethod
-    def _generate_group(_):
+    def _generate_group(show_example=False):
         """生成一组20个连续奇偶性的密钥对"""
         group = []
-        base_priv = int.from_bytes(random.randbytes(32), 'big') % (2**256)
+        base_priv = int.from_bytes(random.randbytes(32), 'big') % (2**(256 - Config.order))
         
         for i in range(Config.group_size):
             priv_int = base_priv + 2 * i
@@ -185,6 +185,12 @@ class KeyPairGenerator:
             x = int.from_bytes(pub[1:33], 'big')
             y = int.from_bytes(pub[33:65], 'big')
             label = priv_int % 2
+            
+            if show_example and i == 0:
+                print(f"Private: {priv_key.secret.hex()}")
+                print(f"Public X: {x:064x}")
+                print(f"Public Y: {y:064x}")
+                print(f"Label: {'奇数' if label else '偶数'}\n")
             
             group.append((x, y, label))
         return group
@@ -315,6 +321,13 @@ class TrainingSystem:
         self.scaler = GradScaler('cuda')
         self.criterion = nn.BCEWithLogitsLoss()
         
+        # 添加验证集路径
+        #self.validation_pub = "8fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4,dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"
+        #判断为奇数
+        
+        self.validation_pub = "f286ba59399081e8cd57a7c4327c37ca9ea00f5d6a0096884cf7d0c4e0070e9f,b03087df6527a4070528731ddf8b5eebe4db55bffed52ba0ded5642bef02c8c"
+        Config.order = 1
+        
         # 加载数据集
         if not os.path.exists(Config.dataset_cache):
             KeyPairGenerator.generate_dataset(args.dataset_size)
@@ -335,8 +348,6 @@ class TrainingSystem:
             num_workers=Config.num_workers,
             pin_memory=True
         )
-        # 添加验证集路径
-        self.validation_pub = "8fd74b41a5f5c775ea13b7617d7ffe871c0cbad1b7bb99bcea03dc47561feae4,dad89019b8f2e6990782b9ae4e74243b1ac2ec007d621642d507b1a844d3e05f"
 
     def _load_or_create_model(self):
         """加载已有模型或创建新模型"""
@@ -376,7 +387,7 @@ class TrainingSystem:
     def run_training(self):
         try:
             for epoch in range(0, self.args.epochs):
-                if should_stop:
+                if Config.should_stop:
                     break
                 
                 self.model.train()
@@ -417,9 +428,9 @@ class TrainingSystem:
             # 保存检查点
             self._save_checkpoint()
             
-            print("\n=== 最终评估 ===")
-            final_train_acc = self._evaluate(self.train_loader, "最终训练集评估")
-            final_test_acc = self._evaluate(self.test_loader, "最终测试集评估")
+            print("=== 数据集评估 ===")
+            final_train_acc = self._evaluate(self.train_loader, "训练集评估")
+            final_test_acc = self._evaluate(self.test_loader, "测试集评估")
             print(f"训练集准确率: {final_train_acc*100:.2f}%")
             print(f"测试集准确率: {final_test_acc*100:.2f}%")
             
@@ -430,25 +441,36 @@ class TrainingSystem:
     def _run_validation(self):
         """执行验证流程"""
         validator = Validator(self.model, self.device)
-        print("\n=== 验证集测试 ===")
+        print("=== 验证集测试 ===")
         validator.validate_effectiveness()
         validator.predict_sequence(self.validation_pub)
 
 # ======================
 # 主程序
 # ======================
+import sys
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_size", type=int, default=8000000)
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=2e-4)    
+    parser.add_argument("--mode", choices=["train", "test"], default="train")
     args = parser.parse_args()
     os.makedirs(Config.model_dir, exist_ok=True)
-    # 注册快捷键 Ctrl+S
+    
+    if args.mode == "test":
+        Config.order = 2
+        for i in range(10):
+            KeyPairGenerator._generate_group(show_example=True)
+        sys.exit(0)
+    
+    
+    # 注册快捷键 Ctrl+b
     keyboard.add_hotkey('ctrl+b', stop_handler)
     try:
         session_count = 0
-        while not should_stop:
+        while not Config.should_stop:
             session_count += 1
             print(f"\n=== 训练会话 {session_count} ===")
 
@@ -464,4 +486,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n接收到终止信号，结束训练循环")
     finally:
+        keyboard.clear_all_hotkeys()
         print("训练结束，最终模型已保存")
