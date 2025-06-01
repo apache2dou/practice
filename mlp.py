@@ -424,7 +424,7 @@ class TrainingSystem:
         """加载已有模型或创建新模型"""
         model = DeepResidualMLP(
             input_dim=512,
-            hidden_dim=1024,
+            hidden_dim=512,
             num_layers=100,
             dropout=0.1
         ).to(self.device)
