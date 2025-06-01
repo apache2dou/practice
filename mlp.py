@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
 from coincurve import PrivateKey, PublicKey
 import os
@@ -259,43 +260,116 @@ class BinaryKeyDataset(Dataset):
         return features, label
 
 # ======================
-# 深度MLP网络
+# 输入处理模块
 # ======================
-class DeepParityMLP(nn.Module):
-    def __init__(self):
+class InputProcessor:
+    @staticmethod
+    def normalize_binary_features(features):
+        """
+        处理512位二进制输入，防止梯度消失/爆炸
+        方法：
+        1. 转换为浮点数张量 (0.0/1.0)
+        2. 归一化到 [-0.5, 0.5] 区间
+        3. 添加高斯噪声增强鲁棒性
+        """
+        # 转换为浮点张量
+        if isinstance(features, torch.Tensor):
+            tensor = features.detach().clone().float()
+        else:
+            tensor = torch.tensor(features, dtype=torch.float32)
+			
+        # 归一化到 [-0.5, 0.5]
+        normalized = tensor - 0.5
+        
+        # 训练时添加微小噪声
+        if normalized.requires_grad:
+            noise = torch.randn_like(normalized) * 0.01
+            normalized += noise
+        
+        return normalized
+    
+    @staticmethod
+    def positional_encoding(features, max_len=512):
+        """添加位置编码增强序列信息"""
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, 128, 2).float() * (-np.log(10000.0) / 128))
+        
+        pe = torch.zeros(max_len, 128)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # 拼接位置编码
+        return torch.cat([features, pe[:features.size(0)]], dim=1)
+# ======================
+# 100层深度残差网络
+# ======================
+class DeepResidualMLP(nn.Module):
+    def __init__(self, input_dim=512, hidden_dim=256, num_layers=100, dropout=0.2):
         super().__init__()
-        layers = []        
-        layers += [
-            nn.Linear(512, 1024),
-            nn.BatchNorm1d(1024),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.3)
-        ]
-        for i in range(99):
-            layers += [
-                nn.Linear(1024, 1024),
-                nn.BatchNorm1d(1024),
-                nn.LeakyReLU(0.1),
-                nn.Dropout(0.3)
-            ]
-
-        layers +=[
-            nn.Linear(1024, 32),
-            nn.BatchNorm1d(32),
-            nn.LeakyReLU(0.1),
-            nn.Linear(32, 1)
-        ]
-        self.layers = nn.Sequential(*layers)
+        
+        # 输入投影层
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        
+        # 残差块堆叠
+        self.residual_blocks = nn.ModuleList()
+        for i in range(num_layers):
+            self.residual_blocks.append(
+                ResidualBlock(hidden_dim, dropout=dropout)
+            )
+        
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, 1)
+        )
+        # 初始化权重
         self._init_weights()
     
     def _init_weights(self):
-        for layer in self.layers:
-            if isinstance(layer, nn.Linear):
-                nn.init.kaiming_normal_(layer.weight, a=0.1, nonlinearity='leaky_relu')
-                nn.init.zeros_(layer.bias)
+        # He初始化配合LeakyReLU
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight, 
+                                        a=0.1, 
+                                        mode='fan_in', 
+                                        nonlinearity='leaky_relu')
+                nn.init.zeros_(module.bias)
     
     def forward(self, x):
-        return self.layers(x).squeeze()
+        # 输入处理
+        x = InputProcessor.normalize_binary_features(x)
+        
+        # 初始投影
+        x = self.input_proj(x)
+        
+        # 残差连接
+        for block in self.residual_blocks:
+            x = block(x)
+        
+        # 输出
+        return self.output_layer(x).squeeze(-1)
+
+class ResidualBlock(nn.Module):
+    def __init__(self, dim, expansion=4, dropout=0.2):
+        super().__init__()
+        inner_dim = dim * expansion
+        
+        self.block = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, inner_dim),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        # 门控机制
+        self.gate = nn.Parameter(torch.tensor([1.0]))
+    
+    def forward(self, x):
+        identity = x
+        out = self.block(x)
+        return identity + self.gate * out
 
 # ======================
 # 训练系统
@@ -306,7 +380,7 @@ class TrainingSystem:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 初始化模型和优化器
-        self.model, self.optimizer = self._load_or_create_model()
+        self.model, self.optimizer, self.scheduler = self._load_or_create_model()
         self.scaler = GradScaler('cuda')
         self.criterion = nn.BCEWithLogitsLoss()
         
@@ -348,17 +422,29 @@ class TrainingSystem:
 
     def _load_or_create_model(self):
         """加载已有模型或创建新模型"""
-        model = DeepParityMLP().to(self.device)
+        model = DeepResidualMLP(
+            input_dim=512,
+            hidden_dim=1024,
+            num_layers=100,
+            dropout=0.1
+        ).to(self.device)
         optimizer = optim.AdamW(model.parameters(), lr=self.args.lr, weight_decay=1e-5)
-        
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.args.lr*10,
+            steps_per_epoch=1000,
+            epochs=100,
+            anneal_strategy='cos'
+        )
         checkpoint_path = os.path.join(Config.model_dir, Config.checkpoint_file)
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path)
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
             print(f"从检查点恢复.")
         
-        return model, optimizer
+        return model, optimizer, scheduler
         
     def _evaluate(self, loader, desc="评估"):
         self.model.eval()
@@ -378,7 +464,8 @@ class TrainingSystem:
         os.makedirs(Config.model_dir, exist_ok=True)
         torch.save({
             'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict()
+            'optimizer': self.optimizer.state_dict(),
+			'scheduler': self.scheduler.state_dict()
         }, os.path.join(Config.model_dir, Config.checkpoint_file))
 
     def run_training(self):
@@ -402,9 +489,12 @@ class TrainingSystem:
                         loss = self.criterion(outputs, labels)
                     
                     self.scaler.scale(loss).backward()
+					# 梯度裁剪防止爆炸
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    
+                    self.scheduler.step()
+					
                     # 累计统计
                     batch_size = inputs.size(0)
                     epoch_loss += loss.item() * batch_size
