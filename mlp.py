@@ -444,9 +444,8 @@ class TrainingSystem:
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             epoch_count = checkpoint.get('epoch_count', 0)
-            if epoch_count > 0:
-                scheduler.load_state_dict(checkpoint['scheduler'])
-                scaler.load_state_dict(checkpoint['scaler'])
+            scheduler.load_state_dict(checkpoint['scheduler'])
+            scaler.load_state_dict(checkpoint['scaler'])
             print(f"从检查点恢复 (epoch={epoch_count})")
         
         return model, optimizer, scheduler, scaler, epoch_count
