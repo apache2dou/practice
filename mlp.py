@@ -13,6 +13,7 @@ import keyboard
 import numpy as np
 from torch.amp import GradScaler, autocast
 from multiprocessing import Pool, cpu_count
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 
 # ======================
 # 全局配置
@@ -304,7 +305,7 @@ class InputProcessor:
 # 100层深度残差网络
 # ======================
 class DeepResidualMLP(nn.Module):
-    def __init__(self, input_dim=512, hidden_dim=256, num_layers=100, dropout=0.2):
+    def __init__(self, input_dim=512, hidden_dim=512, num_layers=100, dropout=0.2):
         super().__init__()
         
         # 输入投影层
@@ -380,8 +381,7 @@ class TrainingSystem:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # 初始化模型和优化器
-        self.model, self.optimizer, self.scheduler = self._load_or_create_model()
-        self.scaler = GradScaler('cuda')
+        self.model, self.optimizer, self.scheduler, self.scaler, self.epoch_count = self._load_or_create_model()
         self.criterion = nn.BCEWithLogitsLoss()
         
         # 添加验证集路径
@@ -429,22 +429,27 @@ class TrainingSystem:
             dropout=0.1
         ).to(self.device)
         optimizer = optim.AdamW(model.parameters(), lr=self.args.lr, weight_decay=1e-5)
-        scheduler = optim.lr_scheduler.OneCycleLR(
+        # 无限epoch调度器 - 余弦退火重启
+        scheduler = CosineAnnealingWarmRestarts(
             optimizer,
-            max_lr=self.args.lr*10,
-            steps_per_epoch=1000,
-            epochs=100,
-            anneal_strategy='cos'
+            T_0=100,  # 初始重启周期
+            T_mult=2,  # 周期倍增因子
+            eta_min=1e-6  # 最小学习率
         )
+        scaler = GradScaler('cuda')
+        epoch_count = 0
         checkpoint_path = os.path.join(Config.model_dir, Config.checkpoint_file)
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path)
             model.load_state_dict(checkpoint['model'])
             optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            print(f"从检查点恢复.")
+            epoch_count = checkpoint.get('epoch_count', 0)
+            if epoch_count > 0:
+                scheduler.load_state_dict(checkpoint['scheduler'])
+                scaler.load_state_dict(checkpoint['scaler'])
+            print(f"从检查点恢复 (epoch={epoch_count})")
         
-        return model, optimizer, scheduler
+        return model, optimizer, scheduler, scaler, epoch_count
         
     def _evaluate(self, loader, desc="评估"):
         self.model.eval()
@@ -463,9 +468,11 @@ class TrainingSystem:
         """保存训练状态"""
         os.makedirs(Config.model_dir, exist_ok=True)
         torch.save({
+            'epoch_count': self.epoch_count,
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-			'scheduler': self.scheduler.state_dict()
+            'scheduler': self.scheduler.state_dict(),
+            'scaler': self.scaler.state_dict(),
         }, os.path.join(Config.model_dir, Config.checkpoint_file))
 
     def run_training(self):
@@ -473,13 +480,13 @@ class TrainingSystem:
             for epoch in range(0, self.args.epochs):
                 if Config.should_stop:
                     break
-                
+                self.epoch_count += 1
                 self.model.train()
                 epoch_loss = 0.0
                 epoch_acc = 0.0
                 processed_samples = 0
                              
-                for inputs, labels in self.train_loader:                    
+                for batch_idx, (inputs, labels) in enumerate(self.train_loader):                    
                     inputs = inputs.to(self.device, non_blocking=True)
                     labels = labels.to(self.device, non_blocking=True)
                     
@@ -493,7 +500,8 @@ class TrainingSystem:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    self.scheduler.step()
+                    # 更新学习率（每个batch后）
+                    self.scheduler.step(self.epoch_count + batch_idx / len(self.train_loader))
 					
                     # 累计统计
                     batch_size = inputs.size(0)
@@ -574,4 +582,4 @@ if __name__ == "__main__":
         print("\n接收到终止信号，结束训练循环")
     finally:
         keyboard.clear_all_hotkeys()
-        print("训练结束，最终模型已保存")
+        print("训练结束")
