@@ -146,7 +146,7 @@ class Validator:
             
             # 多数投票决定最终预测
             majority_vote = 1 if sum(p[0] for p in predictions) > len(predictions)/2 else 0
-            sequence_confidence = np.mean(np.array(list(p[1] for p in predictions)))
+            sequence_confidence = np.mean([p[1] for p in predictions])
             
             # 检查预测是否正确
             if majority_vote == true_parity:
@@ -161,11 +161,11 @@ class Validator:
         print(f"准确率: {accuracy*100:.2f}%")
         print(f"平均置信度(仅计算正确的序列(序列均值)): {avg_confidence*100:.2f}%")
         return accuracy, avg_confidence
+
 # ======================
 # 信号处理器
 # ======================
-    
-def stop_handler( ):
+def stop_handler():
     print(f"\n捕获信号，正在终止训练...")
     Config.should_stop = True
 
@@ -226,7 +226,7 @@ class KeyPairGenerator:
                     for i_in_group, (x, y, label) in enumerate(group):
                         idx = (start_group + group_idx) * Config.group_size + i_in_group
                         
-                        # 修正：直接存储字节数据
+                        # 直接存储字节数据
                         x_bytes = x.to_bytes(32, 'big')
                         y_bytes = y.to_bytes(32, 'big')
                         features = np.frombuffer(x_bytes + y_bytes, dtype=np.uint8)
@@ -253,9 +253,9 @@ class BinaryKeyDataset(Dataset):
     
     def __getitem__(self, idx):
         data = self.memmap[idx]
-        # 修正：在加载时转换为二进制位
+        # 使用更快的解包方法
         features = torch.from_numpy(
-            np.unpackbits(data[:-1])  # 将64字节转换为512位
+            np.unpackbits(data[:-1], axis=0)  # 使用axis参数加速
         ).float()
         label = torch.tensor(data[-1], dtype=torch.float32)
         return features, label
@@ -278,7 +278,7 @@ class InputProcessor:
             tensor = features.detach().clone().float()
         else:
             tensor = torch.tensor(features, dtype=torch.float32)
-			
+        
         # 归一化到 [-0.5, 0.5]
         normalized = tensor - 0.5
         
@@ -288,24 +288,12 @@ class InputProcessor:
             normalized += noise
         
         return normalized
-    
-    @staticmethod
-    def positional_encoding(features, max_len=512):
-        """添加位置编码增强序列信息"""
-        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, 128, 2).float() * (-np.log(10000.0) / 128))
-        
-        pe = torch.zeros(max_len, 128)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        # 拼接位置编码
-        return torch.cat([features, pe[:features.size(0)]], dim=1)
+
 # ======================
-# 100层深度残差网络
+# 优化后的深度残差网络
 # ======================
 class DeepResidualMLP(nn.Module):
-    def __init__(self, input_dim=512, hidden_dim=512, num_layers=100, dropout=0.2):
+    def __init__(self, input_dim=512, hidden_dim=384, num_layers=90, dropout=0.15):
         super().__init__()
         
         # 输入投影层
@@ -351,7 +339,7 @@ class DeepResidualMLP(nn.Module):
         return self.output_layer(x).squeeze(-1)
 
 class ResidualBlock(nn.Module):
-    def __init__(self, dim, expansion=4, dropout=0.2):
+    def __init__(self, dim, expansion=2, dropout=0.15):  # 减小扩展因子
         super().__init__()
         inner_dim = dim * expansion
         
@@ -414,8 +402,8 @@ class TrainingSystem:
             persistent_workers=True
         )
         self.test_loader = DataLoader(
-            Subset(full_dataset, range(train_size,len(full_dataset))),
-            batch_size=Config.batch_size*2,
+            Subset(full_dataset, range(train_size, len(full_dataset))),
+            batch_size=Config.batch_size * 2,
             num_workers=Config.num_workers,
             pin_memory=True
         )
@@ -424,9 +412,9 @@ class TrainingSystem:
         """加载已有模型或创建新模型"""
         model = DeepResidualMLP(
             input_dim=512,
-            hidden_dim=512,
-            num_layers=100,
-            dropout=0.1
+            hidden_dim=384,  # 减小隐藏层维度
+            num_layers=90,   # 减少层数
+            dropout=0.15
         ).to(self.device)
         optimizer = optim.AdamW(model.parameters(), lr=self.args.lr, weight_decay=1e-5)
         # 无限epoch调度器 - 余弦退火重启
@@ -484,24 +472,29 @@ class TrainingSystem:
                 epoch_loss = 0.0
                 epoch_acc = 0.0
                 processed_samples = 0
-                             
+                start = time.time()
+                
                 for batch_idx, (inputs, labels) in enumerate(self.train_loader):                    
                     inputs = inputs.to(self.device, non_blocking=True)
                     labels = labels.to(self.device, non_blocking=True)
                     
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
                     with autocast('cuda'):
                         outputs = self.model(inputs)
                         loss = self.criterion(outputs, labels)
                     
                     self.scaler.scale(loss).backward()
-					# 梯度裁剪防止爆炸
+                    
+                    # 梯度裁剪防止爆炸
+                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                    
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
-                    # 更新学习率（每个batch后）
-                    self.scheduler.step(self.epoch_count + batch_idx / len(self.train_loader))
-					
+                    
+                    # 每个batch后更新学习率
+                    self.scheduler.step()
+                    
                     # 累计统计
                     batch_size = inputs.size(0)
                     epoch_loss += loss.item() * batch_size
@@ -513,10 +506,10 @@ class TrainingSystem:
                 avg_loss = epoch_loss / processed_samples
                 avg_acc = epoch_acc / processed_samples
                                 
-                
                 print(f"Epoch {epoch+1} 结果 | "
                       f"平均损失: {avg_loss:.4f} | "
-                      f"准确率: {avg_acc*100:.2f}% | ")
+                      f"准确率: {avg_acc*100:.2f}% | "
+                      f"耗时 {time.time()-start:.1f}秒 | ")
         
         finally:
             # 保存检查点
