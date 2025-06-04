@@ -132,8 +132,10 @@ class Validator:
     
     def validate_effectiveness(self, num_sequences=100, sequence_length=100):
         """批量验证模型有效性"""
-        correct_count = 0
+        correct_count = [0,0]
         confidence_sum = 0.0
+        true_parity_count = [0,0]
+        majority_vote_count = [0,0]
         
         for i in range(num_sequences):
             # 生成随机序列
@@ -148,17 +150,21 @@ class Validator:
             majority_vote = 1 if sum(p[0] for p in predictions) > len(predictions)/2 else 0
             sequence_confidence = np.mean([p[1] for p in predictions])
             
+            true_parity_count[true_parity] += 1
+            majority_vote_count[majority_vote] += 1
+            
             # 检查预测是否正确
             if majority_vote == true_parity:
-                correct_count += 1
+                correct_count[majority_vote] += 1
                 confidence_sum += sequence_confidence
         
+        correct_count_sum = sum(correct_count)
         # 计算统计指标
-        accuracy = correct_count / num_sequences
-        avg_confidence = confidence_sum / correct_count if correct_count > 0 else 0
+        accuracy = correct_count_sum / num_sequences
+        avg_confidence = confidence_sum / correct_count_sum if correct_count_sum > 0 else 0
         
-        print(f"验证结果（{num_sequences}组序列）:")
-        print(f"准确率: {accuracy*100:.2f}%")
+        print(f"验证结果（{num_sequences}组序列 {true_parity_count[0]}偶 {true_parity_count[1]}奇, 推测为{majority_vote_count[0]}偶 {majority_vote_count[1]}奇）:")
+        print(f"准确率: {accuracy*100:.2f}% {correct_count[0]}偶 {correct_count[1]}奇")
         print(f"平均置信度(仅计算正确的序列(序列均值)): {avg_confidence*100:.2f}%")
         return accuracy, avg_confidence
 
