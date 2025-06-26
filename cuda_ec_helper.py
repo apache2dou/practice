@@ -3,6 +3,7 @@ r_ = 0x10000000000000000000000000000000000000000000000000000000000000000
 r = r_-p
 print('r:'+hex(r))
 print('r平方:'+hex(r*r))
+print('r三次方:'+hex(r*r*r))
 
 from sympy import mod_inverse
 
