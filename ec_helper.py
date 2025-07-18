@@ -43,3 +43,10 @@ def generate_custom_curve(bits=64):
 # 生成曲线
 curve_params = generate_custom_curve(bits=64)
 print("曲线参数:", curve_params)
+
+#计算256 r-adding 齐步走的概率
+result = 1.0
+for i in range(1, 256):
+    result *= 256 / i
+
+print(f"Result: {result:.6e}")
